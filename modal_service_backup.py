@@ -1,0 +1,268 @@
+"""
+Simple Modal service for AudioCraft MusicGen music generation.
+This service downloads the MusicGen model and provides endpoints to generate music from text prompts.
+"""
+
+import io
+import os
+from typing import Dict, Optional
+import modal
+
+# Create the Modal app
+app = modal.App("musicgen-service")
+
+# Define the Modal image with required dependencies
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install([
+        "torch>=2.0.0",
+        "torchaudio>=2.0.0",
+        "transformers>=4.30.0",
+        "audiocraft",
+        "fastapi>=0.100.0",
+        "boto3>=1.26.0",
+        "pydantic>=2.0.0",
+    ])
+    .apt_install(["git", "ffmpeg"])
+)
+
+# Define shared volume for model caching
+volume = modal.Volume.from_name("musicgen-models", create_if_missing=True)
+
+@app.cls(
+    image=image,
+    gpu="A10G",  # Use A10G GPU for faster inference
+    volumes={"/models": volume},
+    timeout=3600,  # 1 hour timeout
+)
+class MusicGenService:
+    # Using Modal's recommended approach to parameterization
+    model = None
+    model_name = None
+        
+    @modal.enter()
+    def load_model(self, model_size: str = "small"):
+        """Load the MusicGen model on container startup."""
+        import torch
+        from audiocraft.models import MusicGen
+        
+        print(f"Loading MusicGen model: {model_size}")
+        
+        # Map model sizes to actual model names
+        model_map = {
+            "small": "facebook/musicgen-small",
+            "medium": "facebook/musicgen-medium", 
+            "large": "facebook/musicgen-large"
+        }
+        
+        model_name = model_map.get(model_size, "facebook/musicgen-small")
+        
+        try:
+            # Load the model with caching in the volume
+            cache_dir = "/models/musicgen"
+            os.makedirs(cache_dir, exist_ok=True)
+            
+            # Load model from cache or download
+            self.model = MusicGen.get_pretrained(model_name, cache_dir=cache_dir)
+            self.model_name = model_name
+            
+            print(f"Successfully loaded {model_name}")
+            
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            # Fall back to small model if others fail
+            self.model = MusicGen.get_pretrained("facebook/musicgen-small")
+            self.model_name = "facebook/musicgen-small"
+            
+    @modal.method()
+    def generate_music(
+        self,
+        prompt: str,
+        duration: float = 10.0,
+        temperature: float = 1.0,
+        cfg_coef: float = 3.0
+    ) -> bytes:
+        """Generate music from a text prompt and return audio bytes."""
+        import torch
+        import torchaudio
+        
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+            
+        print(f"Generating music for prompt: '{prompt}'")
+        print(f"Duration: {duration}s, Temperature: {temperature}, CFG: {cfg_coef}")
+        
+        try:
+            # Set generation parameters
+            self.model.set_generation_params(
+                duration=duration,
+                temperature=temperature,
+                cfg_coef=cfg_coef
+            )
+            
+            # Generate music
+            with torch.no_grad():
+                wav = self.model.generate([prompt])
+            
+            # Convert tensor to audio bytes
+            audio_tensor = wav[0].squeeze().cpu()  # Remove batch dimension and move to CPU
+            
+            # Normalize audio to prevent clipping
+            if audio_tensor.abs().max() > 0:
+                audio_tensor = audio_tensor / audio_tensor.abs().max()
+            
+            # Convert to bytes using torchaudio
+            buffer = io.BytesIO()
+            torchaudio.save(
+                buffer, 
+                audio_tensor.unsqueeze(0),  # Add channel dimension
+                sample_rate=self.model.sample_rate,
+                format="wav"
+            )
+            
+            audio_bytes = buffer.getvalue()
+            print(f"Generated audio: {len(audio_bytes)} bytes")
+            
+            return audio_bytes
+            
+        except Exception as e:
+            print(f"Error generating music: {e}")
+            raise RuntimeError(f"Failed to generate music: {str(e)}")
+
+    @modal.method()
+    def get_model_info(self) -> Dict[str, str]:
+        """Get information about the loaded model."""
+        return {
+            "model_name": self.model_name or "Not loaded",
+            "sample_rate": str(self.model.sample_rate) if self.model else "Unknown"
+        }
+
+@app.function(image=image)
+@modal.fastapi_endpoint(method="GET")
+def health():
+    """Health check endpoint."""
+    return {"status": "healthy", "service": "musicgen"}
+
+@app.function(image=image)
+@modal.fastapi_endpoint(method="GET")
+def list_models():
+    """List available models."""
+    return {
+        "models": [
+            {
+                "id": "small",
+                "name": "MusicGen Small",
+                "description": "Fastest generation, good quality"
+            },
+            {
+                "id": "medium", 
+                "name": "MusicGen Medium",
+                "description": "Balanced speed and quality"
+            },
+            {
+                "id": "large",
+                "name": "MusicGen Large", 
+                "description": "Best quality, slower generation"
+            }
+        ]
+    }
+
+@app.function(image=image, gpu="A10G", volumes={"/models": volume}, timeout=600)
+@modal.fastapi_endpoint(method="POST")
+def generate(request_data: Dict):
+    """Generate music endpoint."""
+    import torch
+    import torchaudio
+    import base64
+    import io
+    from pydantic import BaseModel, Field
+    from audiocraft.models import MusicGen
+    
+    class GenerateRequest(BaseModel):
+        prompt: str = Field(..., min_length=1, max_length=500)
+        duration: float = Field(default=10.0, gt=0, le=30)
+        temperature: float = Field(default=1.0, gt=0, le=2.0)
+        cfg_coef: float = Field(default=3.0, gt=0, le=10.0)
+        model_size: str = Field(default="small", pattern="^(small|medium|large)$")
+    
+    try:
+        # Validate request
+        req = GenerateRequest(**request_data)
+        
+        print(f"Loading MusicGen model: {req.model_size}")
+        
+        # Map model sizes to actual model names
+        model_map = {
+            "small": "facebook/musicgen-small",
+            "medium": "facebook/musicgen-medium", 
+            "large": "facebook/musicgen-large"
+        }
+        
+        model_name = model_map.get(req.model_size, "facebook/musicgen-small")
+        
+        # Load the model with caching in the volume
+        cache_dir = "/models/musicgen"
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Load model from cache or download
+        model = MusicGen.get_pretrained(model_name, cache_dir=cache_dir)
+        print(f"Successfully loaded {model_name}")
+        
+        # Set generation parameters
+        model.set_generation_params(
+            duration=req.duration,
+            temperature=req.temperature,
+            cfg_coef=req.cfg_coef
+        )
+        
+        print(f"Generating music for prompt: '{req.prompt}'")
+        print(f"Duration: {req.duration}s, Temperature: {req.temperature}, CFG: {req.cfg_coef}")
+        
+        # Generate music
+        with torch.no_grad():
+            wav = model.generate([req.prompt])
+        
+        # Convert tensor to audio bytes
+        audio_tensor = wav[0].squeeze().cpu()  # Remove batch dimension and move to CPU
+        
+        # Normalize audio to prevent clipping
+        if audio_tensor.abs().max() > 0:
+            audio_tensor = audio_tensor / audio_tensor.abs().max()
+        
+        # Convert to bytes using torchaudio
+        buffer = io.BytesIO()
+        torchaudio.save(
+            buffer, 
+            audio_tensor.unsqueeze(0),  # Add channel dimension
+            sample_rate=model.sample_rate,
+            format="wav"
+        )
+        
+        audio_bytes = buffer.getvalue()
+        print(f"Generated audio: {len(audio_bytes)} bytes")
+        
+        # Return base64 encoded audio
+        audio_b64 = base64.b64encode(audio_bytes).decode()
+        
+        return {
+            "success": True,
+            "audio_data": audio_b64,
+            "format": "wav",
+            "duration": req.duration,
+            "prompt": req.prompt,
+            "model": req.model_size
+        }
+        
+    except Exception as e:
+        import traceback
+        print(f"Error in generate: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+if __name__ == "__main__":
+    # For local testing
+    print("MusicGen Modal Service")
+    print("Deploy with: modal deploy modal_service.py")

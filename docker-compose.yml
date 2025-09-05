@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  musicgen:
+    build: .
+    container_name: musicgen-app
+    volumes:
+      # Mount generated music directory to host
+      - ./generated_music:/app/generated_music
+      # Mount models directory for caching (optional)
+      - ./models:/app/models
+      # Mount huggingface cache to avoid re-downloading models
+      - huggingface-cache:/root/.cache/huggingface
+    environment:
+      # Set Hugging Face cache directory
+      - HF_HOME=/root/.cache/huggingface
+      # Disable CUDA warnings on CPU-only systems
+      - CUDA_VISIBLE_DEVICES=""
+    # For interactive usage
+    stdin_open: true
+    tty: true
+    # Memory limits (adjust based on your system)
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+
+  # Web interface service (future enhancement)
+  musicgen-web:
+    build: .
+    container_name: musicgen-web
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./generated_music:/app/generated_music
+      - ./models:/app/models
+      - huggingface-cache:/root/.cache/huggingface
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - CUDA_VISIBLE_DEVICES=""
+    command: ["python", "-c", "print('Web interface coming soon!')"]
+    profiles:
+      - web
+
+volumes:
+  huggingface-cache:
